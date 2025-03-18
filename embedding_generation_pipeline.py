@@ -15,10 +15,10 @@ def load_json(file_path):
 pinecone_api_key = os.environ.get("PINECONE_API_KEY")
 openai_api_key = os.environ.get("OPENAI_API_KEY")
 pc = Pinecone(pinecone_api_key)
-json_data = load_json("/home/learnsense/personal/freelance/llm_project/sample_non_author_data_v2.json")
+json_data = load_json("/home/learnsense/personal/freelance/llm_rag_project/json_data/ASH_Conf_2024_sampled_final.json")
 
 # index_name = "llama-embed-v2-non-author-with-time-v2"
-index_name = "openai-large-embed-v4"
+index_name = "openai-large-embed-v5-full"
 
 if not pc.has_index(index_name):
     pc.create_index(
@@ -67,7 +67,7 @@ batch_size = 50  # Adjust batch size as needed
 for i in range(0, len(documents), batch_size):
     batch_docs = documents[i:i + batch_size]
     batch_texts = [doc.page_content for doc in batch_docs]
-
+    print(f"Processing documents {i} to {i + len(batch_texts)}")
     # embeddings = pc.inference.embed(
     #     model="text-embedding-3-large",
     #     inputs=batch_texts,

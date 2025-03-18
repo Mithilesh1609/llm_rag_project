@@ -1,5 +1,7 @@
-numpy==1.26.4
+numpy
 langchain
 pinecone
-json
-Python==3.11
+langchain-community
+openai
+tiktoken
+langchain-pinecone
