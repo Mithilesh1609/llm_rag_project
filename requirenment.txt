@@ -5,3 +5,6 @@ langchain-community
 openai
 tiktoken
 langchain-pinecone
+langchain-google-genai
+fastapi
+uvicorn

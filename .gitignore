@@ -1,1 +1,6 @@
 .env
+*.json
+*.txt
+*.index
+*.log
+*.pkl
