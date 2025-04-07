@@ -31,17 +31,20 @@ def get_pinecone_client(config: Config = Depends(get_config)):
 
 # Models
 class DocumentMetadata(BaseModel):
-    manual_id: Optional[str] = ""
-    source_id: Optional[str] = ""
-    url: Optional[str] = ""
-    date: Optional[str] = ""
-    location: Optional[str] = ""
-    category: Optional[str] = ""
-    article_title: Optional[str] = ""
-    session_title: Optional[str] = ""
-    start_time: Optional[str] = ""
-    end_time: Optional[str] = ""
-    abstract_text: Optional[str] = ""
+    affiliations: Optional[str] = None
+    details: Optional[str] = None
+    date: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    location: Optional[str] = None
+    newsType: Optional[str] = None
+    session_title: Optional[str] = None
+    session_text: Optional[str] = None
+    category: Optional[str] = None
+    subCategory: Optional[str] = None
+    disclosure: Optional[str] = None
+    disease: Optional[List[Dict[str, str]]] = None
+    sponsor: Optional[str] = None
 
 class Document(BaseModel):
     content: str
@@ -93,6 +96,46 @@ class QueryResponse(BaseModel):
     query_time_ms: Optional[float] = None
 
 # 1. Create Embeddings API
+import requests
+import json
+import uuid
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from pinecone import Pinecone, ServerlessSpec
+
+app = FastAPI()
+
+# Config model
+class Config:
+    def __init__(self):
+        self.openai_api_key = "your-openai-api-key"
+        self.pinecone_api_key = "your-pinecone-api-key"
+
+def get_config():
+    return Config()
+
+def get_pinecone_client(config: Config = Depends(get_config)):
+    return Pinecone(api_key=config.pinecone_api_key)
+
+# Request and response models
+class CreateEmbeddingsRequest(BaseModel):
+    index_name: str
+    dimension: int = 1536
+    namespace: str = "default"
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    embedding_type: str = "openai"
+    documents: List[Dict[str, Any]]
+
+class EmbeddingResponse(BaseModel):
+    success: bool
+    message: str
+    document_ids: List[str]
+    count: int
+
 @app.post("/api/create_embeddings", response_model=EmbeddingResponse)
 async def create_embeddings(
     request: CreateEmbeddingsRequest,
@@ -123,68 +166,104 @@ async def create_embeddings(
         )
         
         document_ids = []
-        vectors = []
+        all_chunks = []
+        all_metadatas = []
         
         for doc in request.documents:
-            # Create formatted content
-            content = (
-                f"Title: {doc.metadata.article_title}\n"
-                f"Session: {doc.metadata.session_title}\n"
-                f"Abstract: {doc.metadata.abstract_text}\n"
-                f"Category: {doc.metadata.category}\n"
-                f"Session Date: {doc.metadata.date}\n"
-                f"Location: {doc.metadata.location}\n"
-                f"Start Time: {doc.metadata.start_time}\n"
-                f"End Time: {doc.metadata.end_time}\n"
-                f"{doc.content}"
-            )
+            # Format disease information
+            disease_info = "N/A"
+            if "disease" in doc and doc["disease"]:
+                disease_names = [d.get("name", "") for d in doc["disease"]]
+                disease_info = ', '.join(disease_names)
+            
+            # Create content to be embedded
+            content = f"""
+                Title: {doc.get('session_title', '') or doc.get('brief_title', '') or 'N/A'}
+                Date: {doc.get('date', 'N/A')}
+                Time: {doc.get('start_time', 'N/A')} - {doc.get('end_time', 'N/A')}
+                Location: {doc.get('location', 'N/A')}
+                Category: {doc.get('category', 'N/A')}
+                SubCategory: {doc.get('sub_category', 'N/A')}
+                Diseases: {disease_info}
+                Sponsor: {doc.get('sponsor', 'N/A')}
+                Session Text: {doc.get('session_text', 'N/A')}
+                Disclosure: {doc.get('disclosures', 'N/A')}
+                News Type: {doc.get('news_type', 'N/A')}
+                Affiliation: {doc.get('affiliations', 'N/A')}
+                Details: {doc.get('details', 'N/A')}
+                Summary: {doc.get('summary', 'N/A')}
+                Authors: {doc.get('authors', 'N/A')}
+            """
             
             # Split into chunks
             chunks = text_splitter.split_text(content)
             
-            # Process each chunk
+            # Create metadata for each chunk
             for chunk in chunks:
                 doc_id = str(uuid.uuid4())
                 document_ids.append(doc_id)
+                all_chunks.append(chunk)
                 
-                # Generate embeddings based on selected method
-                if request.embedding_type.lower() == "openai":
-                    embedding_model = OpenAIEmbeddings(
-                        model="text-embedding-3-large", 
-                        openai_api_key=config.openai_api_key
-                    )
-                    embedding = embedding_model.embed_query(chunk)
-                    
-                    vectors.append({
-                        "id": doc_id,
-                        "values": embedding,
-                        "metadata": {
-                            **doc.metadata.dict(),
-                            "content": chunk
-                        }
-                    })
-                    
-                elif request.embedding_type.lower() == "llama":
-                    embedding_response = pc.inference.embed(
-                        model="llama-text-embed-v2",
-                        inputs=[chunk],
-                        parameters={"input_type": "passage", "truncate": "END", "dimension": 2048},
-                    )
-                    
-                    vectors.append({
-                        "id": doc_id,
-                        "values": embedding_response[0]['values'],
-                        "metadata": {
-                            **doc.metadata.dict(),
-                            "content": chunk
-                        }
-                    })
+                # Create metadata with only the specified fields
+                metadata = {
+                    "source_id": doc.get("source_id", ""),
+                    "session_id": doc.get("session_id", ""),
+                    "trial_ids": doc.get("trial_ids", ""),
+                    "abstract_number": doc.get("abstract_number", ""),
+                    "Conf_Upload_Version": doc.get("Conf_Upload_Version", ""),
+                    "date": doc.get("date", ""),
+                    "start_time": doc.get("start_time", ""),
+                    "end_time": doc.get("end_time", ""),
+                    "location": doc.get("location", ""),
+                    "news_type": doc.get("news_type", ""),
+                    "category": doc.get("category", ""),
+                    "sub_category": doc.get("sub_category", ""),
+                    "document_id": doc_id
+                }
+                
+                # Add disease information if available
+                if "disease" in doc and doc["disease"]:
+                    metadata["disease"] = doc["disease"]
+                
+                all_metadatas.append(metadata)
         
-        # Upsert vectors
-        index.upsert(
-            vectors=vectors,
-            namespace=request.namespace
-        )
+        # Initialize embedding model (only once)
+        if request.embedding_type.lower() == "openai":
+            embedding_model = OpenAIEmbeddings(
+                model="text-embedding-3-large", 
+                openai_api_key=config.openai_api_key
+            )
+            
+            # Process in batches
+            batch_size = 100  # Adjust as needed
+            total_chunks = len(all_chunks)
+            
+            for i in range(0, total_chunks, batch_size):
+                batch_end = min(i + batch_size, total_chunks)
+                print(f"Processing chunks {i} to {batch_end}")
+                
+                # Get batch of chunks and their IDs
+                batch_chunks = all_chunks[i:batch_end]
+                batch_ids = document_ids[i:batch_end]
+                batch_metadatas = all_metadatas[i:batch_end]
+                
+                # Generate embeddings for the batch
+                batch_embeddings = embedding_model.embed_documents(batch_chunks)
+                
+                # Prepare vectors for upsert
+                vectors = []
+                for j, embedding in enumerate(batch_embeddings):
+                    vectors.append({
+                        "id": batch_ids[j],
+                        "values": embedding,
+                        "metadata": batch_metadatas[j]
+                    })
+                
+                # Upsert batch of vectors
+                index.upsert(
+                    vectors=vectors,
+                    namespace=request.namespace
+                )
         
         return EmbeddingResponse(
             success=True,
@@ -302,7 +381,14 @@ async def delete_embeddings(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+class QueryRequest(BaseModel):
+    index_name: str
+    query_text: str
+    top_k: int = 5
+    embedding_type: str = "openai"
+    namespace: Optional[str] = "default"
+    include_metadata: bool = True
+    filter: Optional[Dict[str, Any]] = None
 # 4. Query API
 @app.post("/api/query", response_model=QueryResponse)
 async def query_embeddings(
