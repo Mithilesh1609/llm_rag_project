@@ -1,9 +1,9 @@
 import os
-import json
 import uuid
 import requests
 import time
 import logging
+import fastapi
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -126,7 +126,7 @@ def fetch_conference_data(conference_name: str, page: int = 1):
     try:
         # Method 1: Bearer token in Authorization header
         headers1 = {
-            'Authorization': '596c36c6-0ecd-11f0-8583-0221c24e933b'
+            'Authorization': os.getenv("LARVOL_API_KEY")
             }
         logger.info("Trying authentication method 1: Bearer token in Authorization header")
         
@@ -327,7 +327,7 @@ async def process_conference_data(
             all_chunks = []
             all_metadatas = []
             chunk_ids = []
-            
+            documents = []
             for doc_idx, doc in enumerate(batch_docs):
                 # Format disease information
                 disease_info = "N/A"
@@ -364,7 +364,7 @@ async def process_conference_data(
                 for chunk in chunks:
                     doc_id = str(uuid.uuid4())
                     chunk_ids.append(doc_id)
-                    all_chunks.append(chunk)
+                    # all_chunks.append(chunk)
                     
                     # Create metadata with only the specified fields
                     metadata = prepare_safe_metadata(doc, doc_id, formatted_conf_name)
@@ -373,30 +373,35 @@ async def process_conference_data(
                     if "disease" in doc and doc["disease"]:
                         # Store disease names as a string to avoid complex nested structures in metadata
                         metadata["disease_names"] = disease_info
-                    
-                    all_metadatas.append(metadata)
+                    documents.append(Document(page_content=chunk, metadata=metadata,id=doc_id))
             
-            # Generate embeddings for all chunks in this batch
-            logger.info(f"Generating embeddings for {len(all_chunks)} chunks")
-            batch_embeddings = embedding_model.embed_documents(all_chunks)
+                    # all_metadatas.append(metadata)
+            
+            batch_docs_to_process = documents
+            batch_texts_to_process = [doc.page_content for doc in batch_docs_to_process]
+            logger.info(f"Generating embeddings for {len(batch_texts_to_process)} chunks")
+            batch_embeddings = embedding_model.embed_documents(batch_texts_to_process)
             logger.info(f"Successfully generated {len(batch_embeddings)} embeddings")
-            
-            # Prepare vectors for upsert
             vectors = []
-            for j, embedding in enumerate(batch_embeddings):
-                vectors.append({
-                    "id": chunk_ids[j],
-                    "values": embedding,
-                    "metadata": all_metadatas[j]
-                })
-            
-            # Upsert batch of vectors
+
+            for j, embedding_values in enumerate(batch_embeddings):
+            # Include the page_content in the metadata
+                metadata = batch_docs_to_process[j].metadata.copy()
+                metadata["page_content"] = batch_docs_to_process[j].page_content
+                vectors.append((str(i + j), embedding_values, metadata))
             logger.info(f"Upserting {len(vectors)} vectors to Pinecone index '{index_name}', namespace '{namespace}'")
             index.upsert(
                 vectors=vectors,
                 namespace=namespace
             )
             logger.info(f"Successfully upserted vectors to Pinecone")
+            # Upsert batch of vectors
+            # logger.info(f"Upserting {len(vectors)} vectors to Pinecone index '{index_name}', namespace '{namespace}'")
+            # index.upsert(
+            #     vectors=vectors,
+            #     namespace=namespace
+            # )
+            # logger.info(f"Successfully upserted vectors to Pinecone")
             
             # Add IDs to the global list
             document_ids.extend(chunk_ids)
@@ -658,21 +663,32 @@ async def get_job_status(job_id: str):
 import os
 import json
 import uuid
+import requests
 import time
 import logging
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.embeddings import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
 from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
-from langchain_pinecone import PineconeVectorStore
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import Document
 from pinecone import Pinecone, ServerlessSpec
-from datetime import datetime
 
-# Define your models
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Log to console
+        logging.FileHandler("vector_db_api.log")  # Log to file
+    ]
+)
+logger = logging.getLogger("vector_db_api")
+
 class QueryRequest(BaseModel):
     index_name: str = "conference-data"
     query_text: str
@@ -686,32 +702,50 @@ class QueryResult(BaseModel):
     id: str
     score: float
     metadata: Optional[Dict[str, Any]] = None
+    content: Optional[str] = None
 
 class QueryResponse(BaseModel):
-    results: List[QueryResult] = []
-    count: int = 0
+    results: List[QueryResult]
+    count: int
     query_time_ms: Optional[float] = None
-
+    
 class ConferenceQueryRequest(BaseModel):
     conferenceName: str
     conferenceIteration: str
     query: str
     top_k: int = 5
-    generate_explanation: bool = True
-    llm_model: str = "gemini-1.5-pro"  # or "gpt-4" or others
+    use_rag: bool = True
+    model_name: str = "gpt-4o-mini"
+    temperature: float = 0
 
-class SourceDocument(BaseModel):
-    content: str
-    metadata: Dict[str, Any]
-
-class ConferenceQueryResponse(BaseModel):
+class RagResponse(BaseModel):
     query: str
-    vector_results: List[QueryResult]
-    explanation: Optional[str] = None
-    source_documents: List[SourceDocument] = []
-    timing: Dict[str, float] = {}
+    answer: str
+    sources: List[Dict[str, Any]]
+    retrieval_time_ms: float
+    generation_time_ms: float
+    total_time_ms: float
 
-# Add this to your existing FastAPI application
+# Define prompt template for RAG
+prompt_template = """You are an expert medical orator who analyzes abstracts from medical conferences to answer user questions.
+If the abstracts contain ANY information related to the question, even if incomplete, summarize what is available, and always stick to the given abstracts. Do not provide any information beyond what's in the abstracts.
+Only say you cannot answer if there is absolutely no relevant information. Present your answer in bullet points for easier understanding.
+Try to go deep into the abstracts and identify all necessary information for the given query and summarize well.
+
+QUESTION: {question}
+
+RETRIEVED ABSTRACTS:
+{context}
+
+ANSWER:
+"""
+
+PROMPT = PromptTemplate(
+    template=prompt_template,
+    input_variables=["context", "question"]
+)
+
+# Query API without-streaming
 @app.post("/api/query", response_model=QueryResponse)
 async def query_embeddings(
     request: QueryRequest,
@@ -722,7 +756,7 @@ async def query_embeddings(
     Query Pinecone for similar documents based on a text query.
     """
     try:
-        logger.info(f"Processing query request for index: {request.index_name}, namespace: {request.namespace}")
+        logger.info(f"Processing query: '{request.query_text}' on index '{request.index_name}'")
         
         # Check if index exists
         if not pc.has_index(request.index_name):
@@ -735,30 +769,27 @@ async def query_embeddings(
         # Generate query embedding
         start_time = time.time()
         if request.embedding_type.lower() == "openai":
-            logger.info("Generating OpenAI embedding for query")
+            logger.info("Generating embedding using OpenAI model")
             embedding_model = OpenAIEmbeddings(
                 model="text-embedding-3-large", 
                 openai_api_key=config.openai_api_key
             )
             query_embedding = embedding_model.embed_query(request.query_text)
+            
         elif request.embedding_type.lower() == "llama":
-            logger.info("Generating Llama embedding for query")
+            logger.info("Generating embedding using Llama model")
             embedding_response = pc.inference.embed(
                 model="llama-text-embed-v2",
                 inputs=[request.query_text],
                 parameters={"input_type": "query", "truncate": "END", "dimension": 2048},
             )
             query_embedding = embedding_response[0]['values']
-        else:
-            logger.error(f"Unsupported embedding type: {request.embedding_type}")
-            raise HTTPException(status_code=400, detail=f"Unsupported embedding type: {request.embedding_type}")
         
         embedding_time = time.time() - start_time
-        logger.info(f"Embedding generation time: {embedding_time:.4f}s")
+        logger.info(f"Embedding generation completed in {embedding_time:.4f}s")
         
         # Query the index
         logger.info(f"Querying Pinecone index with top_k={request.top_k}")
-        start_time = time.time()
         query_response = index.query(
             vector=query_embedding,
             top_k=request.top_k,
@@ -766,8 +797,6 @@ async def query_embeddings(
             namespace=request.namespace,
             filter=request.filter
         )
-        query_time = time.time() - start_time
-        logger.info(f"Pinecone query time: {query_time:.4f}s")
         
         # Format results
         results = []
@@ -778,39 +807,87 @@ async def query_embeddings(
                 metadata=match.metadata
             ))
         
-        logger.info(f"Query returned {len(results)} results")
+        logger.info(f"Query completed with {len(results)} results")
         
         return QueryResponse(
             results=results,
             count=len(results),
-            query_time_ms=query_response.usage.total_ms if hasattr(query_response, 'usage') else query_time * 1000
+            query_time_ms=query_response.usage.total_ms if hasattr(query_response, 'usage') else None
         )
         
     except Exception as e:
         logger.error(f"Error in query_embeddings: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+class DeleteEmbeddingsRequest(BaseModel):
+    index_name: str
+    ids: List[str]
+    namespace: Optional[str] = "default"
+@app.post("/api/delete_embeddings", response_model=EmbeddingResponse)
+async def delete_embeddings(
+    request: DeleteEmbeddingsRequest,
+    pc: Pinecone = Depends(get_pinecone_client)
+):
+    """
+    Delete embeddings from Pinecone by ID.
+    """
+    try:
+        # Check if index exists
+        if not pc.has_index(request.index_name):
+            raise HTTPException(status_code=404, detail=f"Index {request.index_name} does not exist")
+        
+        # Get index
+        index = pc.Index(request.index_name)
+        
+        # Delete vectors
+        index.delete(
+            ids=request.ids,
+            namespace=request.namespace
+        )
+        
+        return EmbeddingResponse(
+            success=True,
+            message=f"Successfully deleted {len(request.ids)} embeddings",
+            count=len(request.ids)
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/conference_query", response_model=ConferenceQueryResponse)
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request
+from fastapi.responses import StreamingResponse
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+import asyncio
+from typing import AsyncGenerator
+
+class StreamingCallbackHandler(StreamingStdOutCallbackHandler):
+    def __init__(self):
+        super().__init__()
+        self.tokens = []
+        self.text = ""
+    
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        self.tokens.append(token)
+        self.text += token
+
+@app.post("/api/conference/query_streaming")
 async def query_conference_data(
     request: ConferenceQueryRequest,
+    response: fastapi.Response,
+    background_tasks: BackgroundTasks,
     pc: Pinecone = Depends(get_pinecone_client),
     config: Config = Depends(get_config)
 ):
     """
-    Query conference data with RAG capabilities to both retrieve vector results 
-    and generate human-readable explanations.
+    Query conference data and optionally use RAG to generate a natural language response
+    with simplified streaming capability for real-time response display.
     """
-    start_time_total = time.time()
-    timing = {}
-    
     try:
-        # Format namespace from conference name and iteration
-        namespace = f"{request.conferenceName}_{request.conferenceIteration}".lower()
-        index_name = "conference-data"  # Default index name
-        
         logger.info(f"Processing conference query: '{request.query}' for {request.conferenceName} {request.conferenceIteration}")
-        logger.info(f"Using index: {index_name}, namespace: {namespace}")
+        
+        # Create namespace from conference name and iteration
+        namespace = f"{request.conferenceName.lower()}_{request.conferenceIteration}"
+        index_name = "conference-data"
         
         # Check if index exists
         if not pc.has_index(index_name):
@@ -820,171 +897,156 @@ async def query_conference_data(
         # Get index
         index = pc.Index(index_name)
         
+        # Track timing
+        start_time_total = time.time()
+        retrieval_start_time = time.time()
+        
         # Initialize embedding model
-        start_time = time.time()
+        logger.info("Initializing OpenAI embedding model")
         embedding_model = OpenAIEmbeddings(
             model="text-embedding-3-large", 
             openai_api_key=config.openai_api_key
         )
-        embedding_init_time = time.time() - start_time
-        timing["embedding_initialization"] = embedding_init_time
-        logger.info(f"Embedding model initialized in {embedding_init_time:.4f}s")
         
-        # First approach: Direct query to get vector results
-        start_time = time.time()
-        
-        # Generate query embedding
-        query_embedding = embedding_model.embed_query(request.query)
-        
-        # Query the index
-        query_response = index.query(
-            vector=query_embedding,
-            top_k=request.top_k,
-            include_metadata=True,
-            namespace=namespace,
-        )
-        
-        vector_query_time = time.time() - start_time
-        timing["vector_query_time"] = vector_query_time
-        logger.info(f"Vector query completed in {vector_query_time:.4f}s")
-        
-        # Format vector results
-        vector_results = []
-        source_documents = []
-        
-        for match in query_response.matches:
-            vector_results.append(QueryResult(
-                id=match.id,
-                score=match.score,
-                metadata=match.metadata
-            ))
+        # If using RAG, set up the retrieval system
+        if request.use_rag:
+            logger.info("Setting up RAG system with LangChain")
             
-            # Extract the content from metadata for source documents
-            source_content = ""
-            if match.metadata:
-                # Try to construct meaningful content from metadata
-                title = match.metadata.get("title", "No Title")
-                category = match.metadata.get("category", "")
-                date = match.metadata.get("date", "")
-                
-                # Some metadata contains full content in a field
-                # But for our conference data, we need to reconstruct it
-                source_content = f"Title: {title}\n"
-                if date:
-                    source_content += f"Date: {date}\n"
-                if category:
-                    source_content += f"Category: {category}\n"
-                
-                # Add any other relevant metadata fields
-                for key, value in match.metadata.items():
-                    if key not in ["title", "category", "date"] and value and isinstance(value, str):
-                        source_content += f"{key.replace('_', ' ').title()}: {value}\n"
-                        
-            source_documents.append(SourceDocument(
-                content=source_content,
-                metadata=match.metadata or {}
-            ))
-        
-        explanation = None
-        
-        # Second approach: Use LangChain for RAG if requested
-        if request.generate_explanation:
-            start_time = time.time()
-            logger.info(f"Generating explanation using LLM model: {request.llm_model}")
+            # Create vector store
+            vectorstore = PineconeVectorStore(
+                index=index,
+                embedding=embedding_model,
+                text_key="page_content"
+            )
             
-            try:
-                # Initialize vector store using LangChain
-                vectorstore = PineconeVectorStore(
-                    index=index,
-                    embedding=embedding_model,
-                    namespace=namespace
-                )
-                
-                # Create retriever
-                retriever = vectorstore.as_retriever(
-                    search_type="similarity",
-                    search_kwargs={"k": request.top_k}
-                )
-                
-                # Initialize LLM
-                if request.llm_model.startswith("gemini"):
-                    google_api_key = os.environ.get("GOOGLE_API_KEY")
-                    if not google_api_key:
-                        logger.error("GOOGLE_API_KEY not found in environment variables")
-                        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
-                    
-                    llm = ChatGoogleGenerativeAI(
-                        model=request.llm_model,
-                        google_api_key=google_api_key,
-                        temperature=0
-                    )
-                else:
-                    # Default to using other models if needed
-                    logger.error(f"Unsupported LLM model: {request.llm_model}")
-                    raise HTTPException(status_code=400, detail=f"Unsupported LLM model: {request.llm_model}")
-                
-                # Define prompt template
-                prompt_template = """You are an expert medical orator which analyzes abstracts of the given medical conference and tries to answer the user question.
-                If the abstracts contain ANY information related to the question, even if incomplete, summarize what is available, and always stick to the given abstract information. Do not provide any other information from your own knowledge.
-                Only say you cannot answer if there is absolutely no relevant information, try to give answer in bullet points which is easier to understand and try to go deep in the abstract and identify all necessary information for the given query and summarize well.
-
-                QUESTION: {question}
-
-                RETRIEVED ABSTRACTS:
-                {context}
-
-                ANSWER:
-                """
-
-                PROMPT = PromptTemplate(
-                    template=prompt_template,
-                    input_variables=["context", "question"]
-                )
-                
-                # Create QA chain
-                qa_chain = RetrievalQA.from_chain_type(
-                    llm=llm,
-                    chain_type="stuff",
-                    retriever=retriever,
-                    return_source_documents=True,
-                    chain_type_kwargs={"prompt": PROMPT}
-                )
-                
-                # Execute the query
-                result = qa_chain({"query": request.query})
-                explanation = result["result"]
-                
-                # Update source documents with more detailed information if available
-                if "source_documents" in result:
-                    source_documents = []
-                    for doc in result["source_documents"]:
-                        source_documents.append(SourceDocument(
-                            content=doc.page_content,
-                            metadata=doc.metadata
-                        ))
-                
-                logger.info("LLM explanation generated successfully")
-                
-            except Exception as e:
-                logger.error(f"Error generating explanation: {str(e)}", exc_info=True)
-                explanation = f"Error generating explanation: {str(e)}"
+            # Create retriever
+            retriever = vectorstore.as_retriever(
+                search_type="similarity", 
+                search_kwargs={
+                    "k": request.top_k,
+                    "namespace": namespace
+                }
+            )
             
-            explanation_time = time.time() - start_time
-            timing["explanation_generation_time"] = explanation_time
-            logger.info(f"Explanation generated in {explanation_time:.4f}s")
-        
-        # Calculate total time
-        total_time = time.time() - start_time_total
-        timing["total_time"] = total_time
-        
-        return ConferenceQueryResponse(
-            query=request.query,
-            vector_results=vector_results,
-            explanation=explanation,
-            source_documents=source_documents,
-            timing=timing
-        )
+            # Retrieve relevant documents first
+            logger.info("Retrieving relevant documents")
+            relevant_docs = retriever.get_relevant_documents(request.query)
+            
+            # Record retrieval time
+            retrieval_time = time.time() - retrieval_start_time
+            logger.info(f"Retrieved {len(relevant_docs)} documents in {retrieval_time:.4f}s")
+            
+            # Format sources for the response
+            sources = []
+            for doc in relevant_docs:
+                source_data = {
+                    "content": doc.page_content,
+                    "metadata": doc.metadata
+                }
+                sources.append(source_data)
+            
+            # Prepare context from retrieved documents
+            context = "\n\n".join([doc.page_content for doc in relevant_docs])
+            
+            # Initialize LLM with streaming capability
+            logger.info(f"Initializing LLM with streaming: {request.model_name}")
+            llm = ChatOpenAI(
+                model_name=request.model_name, 
+                openai_api_key=config.openai_api_key, 
+                temperature=request.temperature,
+                streaming=True
+            )
+            
+            # Prepare the prompt
+            formatted_prompt = PROMPT.format(
+                context=context,
+                question=request.query
+            )
+            
+            # Set up streaming response
+            response.headers["Content-Type"] = "text/plain"
+            response.headers["Cache-Control"] = "no-cache"
+            response.headers["Connection"] = "keep-alive"
+            
+            accumulated_answer = ""
+            generation_start_time = time.time()
+            
+            async def generate_stream():
+                nonlocal accumulated_answer
+                
+                # Stream the response content directly as plain text
+                async for chunk in llm.astream(formatted_prompt):
+                    content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                    accumulated_answer += content
+                    yield content
+                
+                # Calculate final metrics (these won't be seen by client in streaming mode)
+                generation_time = time.time() - generation_start_time
+                total_time = time.time() - start_time_total
+                
+                logger.info(f"RAG query completed in {total_time:.4f}s (retrieval: {retrieval_time:.4f}s, generation: {generation_time:.4f}s)")
+                
+                # Store the complete response data for later retrieval if needed
+                response_data = {
+                    "query": request.query,
+                    "answer": accumulated_answer,
+                    "sources": sources,
+                    "retrieval_time_ms": retrieval_time * 1000,
+                    "generation_time_ms": generation_time * 1000,
+                    "total_time_ms": total_time * 1000
+                }
+                
+                # Store in a cache or database if needed for later retrieval
+                # background_tasks.add_task(store_response_data, response_data)
+            
+            # Return the streaming generator with plain text content
+            return fastapi.responses.StreamingResponse(
+                generate_stream(),
+                media_type="text/plain"
+            )
+            
+        else:
+            # Perform direct vector search without RAG
+            logger.info("Performing direct vector search without RAG")
+            
+            # Generate query embedding
+            query_embedding = embedding_model.embed_query(request.query)
+            
+            # Query the index
+            query_response = index.query(
+                vector=query_embedding,
+                top_k=request.top_k,
+                include_metadata=True,
+                namespace=namespace
+            )
+            
+            # Format sources
+            sources = []
+            for match in query_response.matches:
+                content = match.metadata.get("page_content", "Content not available")
+                source_data = {
+                    "content": content,
+                    "metadata": match.metadata,
+                    "score": match.score
+                }
+                sources.append(source_data)
+            
+            # Calculate times
+            retrieval_time = time.time() - retrieval_start_time
+            total_time = time.time() - start_time_total
+            
+            logger.info(f"Vector search completed in {total_time:.4f}s")
+            
+            # For non-RAG searches, return a JSON response
+            return RagResponse(
+                query=request.query,
+                answer="Vector search results only (no RAG generation was requested)",
+                sources=sources,
+                retrieval_time_ms=retrieval_time * 1000,
+                generation_time_ms=0,
+                total_time_ms=total_time * 1000
+            )
         
     except Exception as e:
-        logger.error(f"Error in conference query: {str(e)}", exc_info=True)
+        logger.error(f"Error in query_conference_data: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
