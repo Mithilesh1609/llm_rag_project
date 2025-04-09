@@ -1050,3 +1050,330 @@ async def query_conference_data(
     except Exception as e:
         logger.error(f"Error in query_conference_data: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    
+    
+######## update functionality
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    processed_items: int = 0
+    total_items: int = 0
+    updated_items: int = 0
+    skipped_items: int = 0
+    current_page: int = 0
+    total_pages: int = 0
+    message: Optional[str] = None
+async def update_conference_embeddings(
+    conference_name: str,
+    conference_iteration: str,
+    index_name: str,
+    namespace: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    max_pages: int,
+    job_id: str,
+    pc: Pinecone,
+    config: Config
+):
+    """Background task to update conference data embeddings only if version has changed"""
+    try:
+        logger.info(f"Starting update job {job_id} for conference {conference_name} {conference_iteration}")
+        
+        background_jobs[job_id] = {
+            "status": "running", 
+            "processed_items": 0, 
+            "total_items": 0,
+            "updated_items": 0,
+            "skipped_items": 0,
+            "current_page": 0,
+            "total_pages": 0
+        }
+        
+        # Format the conference name for the API
+        formatted_conf_name = f"{conference_name} {conference_iteration}"
+        logger.info(f"Formatted conference name: {formatted_conf_name}")
+        
+        # Fetch first page to get total pages
+        logger.info(f"Fetching first page to determine total pages")
+        documents, total_pages = fetch_conference_data(formatted_conf_name, 1)
+        
+        # Limit total pages to max_pages
+        total_pages = min(total_pages, max_pages)
+        logger.info(f"Will process {total_pages} pages (limited by max_pages={max_pages})")
+        
+        background_jobs[job_id]["total_pages"] = total_pages
+        background_jobs[job_id]["status"] = f"Fetching data from {total_pages} pages"
+        
+        # Collect all documents from all pages
+        all_documents = documents.copy()
+        logger.info(f"Collected {len(documents)} documents from page 1")
+        
+        for page in range(2, total_pages + 1):
+            background_jobs[job_id]["current_page"] = page
+            background_jobs[job_id]["status"] = f"Fetching page {page} of {total_pages}"
+            logger.info(f"Fetching page {page} of {total_pages}")
+            
+            try:
+                page_documents, _ = fetch_conference_data(formatted_conf_name, page)
+                logger.info(f"Collected {len(page_documents)} documents from page {page}")
+                all_documents.extend(page_documents)
+                
+                # Add a short delay to avoid overwhelming the API
+                time.sleep(0.5)
+            except Exception as e:
+                error_msg = f"Error fetching page {page}: {str(e)}"
+                logger.error(error_msg)
+                background_jobs[job_id]["message"] = error_msg
+                # Continue with the next page
+        
+        # Update job status
+        total_document_count = len(all_documents)
+        background_jobs[job_id]["total_items"] = total_document_count
+        background_jobs[job_id]["status"] = f"Processing {total_document_count} documents"
+        logger.info(f"Total documents collected: {total_document_count}")
+        
+        # Create index if it doesn't exist
+        logger.info(f"Checking if index {index_name} exists")
+        if not pc.has_index(index_name):
+            logger.info(f"Creating new index: {index_name}")
+            pc.create_index(
+                name=index_name,
+                dimension=3072,  # Using dimension=3072 for text-embedding-3-large
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1")
+            )
+        else:
+            logger.info(f"Index {index_name} already exists")
+        
+        # Get index
+        index = pc.Index(index_name)
+        
+        # Process documents
+        logger.info(f"Initializing text splitter with chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size, 
+            chunk_overlap=chunk_overlap
+        )
+        
+        # Initialize embedding model
+        logger.info("Initializing OpenAI embedding model (text-embedding-3-large)")
+        embedding_model = OpenAIEmbeddings(
+            model="text-embedding-3-large", 
+            openai_api_key=config.openai_api_key
+        )
+        
+        document_ids = []
+        processed_count = 0
+        updated_count = 0
+        skipped_count = 0
+        
+        # Process in batches
+        batch_size = 20  # Adjust based on API rate limits and memory constraints
+        logger.info(f"Processing documents in batches of {batch_size}")
+        
+        for i in range(0, len(all_documents), batch_size):
+            batch_docs = all_documents[i:i+batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1} of {(len(all_documents) + batch_size - 1)//batch_size} ({len(batch_docs)} documents)")
+            
+            # Process each document in the batch
+            for doc_idx, doc in enumerate(batch_docs):
+                source_id = str(doc.get("source_id", ""))
+                if not source_id:
+                    logger.warning(f"Document at index {i + doc_idx} has no source_id, skipping")
+                    continue
+                
+                # Check if document already exists in the index and get its metadata
+                # Query by source_id to find existing records
+                existing_docs = index.query(
+                    vector=[0] * 3072,  # Dummy vector for metadata-only query
+                    namespace=namespace,
+                    filter={"source_id": source_id},
+                    include_metadata=True,
+                    top_k=1
+                )
+                
+                # Get the new Conf_Upload_Version
+                new_version = str(doc.get("Conf_Upload_Version", ""))
+                
+                # Check if we need to update this document
+                update_needed = True
+                if existing_docs and existing_docs.matches:
+                    existing_metadata = existing_docs.matches[0].metadata
+                    existing_version = existing_metadata.get("Conf_Upload_Version", "")
+                    
+                    # If versions match, no need to update
+                    if existing_version == new_version and new_version:
+                        logger.info(f"Document with source_id {source_id} already has version {new_version}, skipping")
+                        skipped_count += 1
+                        continue
+                
+                # If we reached here, we need to update or create this document
+                logger.info(f"Updating/creating document with source_id {source_id}, version: {new_version}")
+                
+                # Format disease information
+                disease_info = "N/A"
+                if "disease" in doc and doc["disease"]:
+                    disease_names = [d.get("name", "") for d in doc["disease"] if d.get("name")]
+                    disease_info = ', '.join(disease_names)
+                
+                # Create content to be embedded
+                title = doc.get('session_title', '') or doc.get('brief_title', '') or 'N/A'
+                content = f"""
+                    Title: {title}
+                    Date: {doc.get('date', 'N/A')}
+                    Time: {doc.get('start_time', 'N/A')} - {doc.get('end_time', 'N/A')}
+                    Location: {doc.get('location', 'N/A')}
+                    Category: {doc.get('category', 'N/A')}
+                    SubCategory: {doc.get('sub_category', 'N/A')}
+                    Diseases: {disease_info}
+                    Sponsor: {doc.get('sponsor', 'N/A')}
+                    Session Text: {doc.get('session_text', 'N/A')}
+                    Disclosure: {doc.get('disclosures', 'N/A')}
+                    News Type: {doc.get('news_type', 'N/A')}
+                    Affiliation: {doc.get('affiliations', 'N/A')}
+                    Details: {doc.get('details', 'N/A')}
+                    Summary: {doc.get('summary', 'N/A')}
+                    Authors: {doc.get('authors', 'N/A')}
+                """
+                
+                # Split into chunks
+                chunks = text_splitter.split_text(content)
+                logger.info(f"Document {i + doc_idx + 1}: Split into {len(chunks)} chunks")
+                
+                # Delete any existing documents with this source_id
+                if existing_docs and existing_docs.matches:
+                    try:
+                        # Get all existing documents with this source_id to delete them
+                        all_existing = index.query(
+                            vector=[0] * 3072,
+                            namespace=namespace,
+                            filter={"source_id": source_id},
+                            include_metadata=True,
+                            top_k=100  # Assuming no more than 100 chunks per doc
+                        )
+                        
+                        ids_to_delete = [m.id for m in all_existing.matches]
+                        if ids_to_delete:
+                            logger.info(f"Deleting {len(ids_to_delete)} existing chunks for source_id {source_id}")
+                            index.delete(ids=ids_to_delete, namespace=namespace)
+                    except Exception as e:
+                        logger.error(f"Error deleting existing documents: {str(e)}")
+                
+                # Process and create new chunks
+                vectors = []
+                for chunk_idx, chunk in enumerate(chunks):
+                    doc_id = str(uuid.uuid4())
+                    document_ids.append(doc_id)
+                    
+                    # Create metadata
+                    metadata = prepare_safe_metadata(doc, doc_id, formatted_conf_name)
+                    
+                    # Ensure Conf_Upload_Version is included in metadata
+                    if new_version:
+                        metadata["Conf_Upload_Version"] = new_version
+                    
+                    # Create embedding for this chunk
+                    embedding = embedding_model.embed_query(chunk)
+                    
+                    # Add content to metadata
+                    metadata["page_content"] = chunk
+                    
+                    # Add to vectors for batch upsert
+                    vectors.append((doc_id, embedding, metadata))
+                
+                # Upsert vectors if we have any
+                if vectors:
+                    logger.info(f"Upserting {len(vectors)} new vectors for source_id {source_id}")
+                    index.upsert(vectors=vectors, namespace=namespace)
+                    updated_count += 1
+                
+                processed_count += 1
+            
+            # Update job status
+            background_jobs[job_id]["processed_items"] = processed_count
+            background_jobs[job_id]["updated_items"] = updated_count
+            background_jobs[job_id]["skipped_items"] = skipped_count
+            background_jobs[job_id]["status"] = f"Processed {processed_count} of {len(all_documents)} documents (Updated: {updated_count}, Skipped: {skipped_count})"
+            
+            # Log progress
+            logger.info(f"Progress: {processed_count}/{len(all_documents)} documents processed ({(processed_count/len(all_documents)*100):.2f}%)")
+        
+        # Job completed successfully
+        background_jobs[job_id]["status"] = "completed"
+        background_jobs[job_id]["document_ids"] = document_ids
+        background_jobs[job_id]["count"] = len(document_ids)
+        
+        completion_message = f"Successfully processed {len(document_ids)} chunks from {len(all_documents)} documents. Updated {updated_count}, skipped {skipped_count}."
+        background_jobs[job_id]["message"] = completion_message
+        logger.info(f"Job {job_id} completed: {completion_message}")
+        
+    except Exception as e:
+        error_message = f"Job {job_id} failed: {str(e)}"
+        logger.error(error_message, exc_info=True)
+        background_jobs[job_id]["status"] = "failed"
+        background_jobs[job_id]["message"] = str(e)
+
+@app.post("/api/update_conference_data", response_model=EmbeddingResponse)
+async def update_conference_data(
+    request: ConferenceDataRequest,
+    background_tasks: BackgroundTasks,
+    pc: Pinecone = Depends(get_pinecone_client),
+    config: Config = Depends(get_config)
+):
+    """
+    Update conference data embeddings, but only if the Conf_Upload_Version has changed.
+    This will run as a background task and return a job ID for tracking progress.
+    """
+    logger.info(f"Received request to update conference data: {request.conferenceName} {request.conferenceIteration}")
+    
+    try:
+        # Generate a job ID
+        job_id = str(uuid.uuid4())
+        logger.info(f"Generated job ID: {job_id}")
+        namespace = f"{request.conferenceName}_{request.conferenceIteration}".lower().replace(" ", "_")
+        logger.info(f"Using namespace: {namespace}")
+        logger.info(f"Request details: {request}")
+        
+        # Initialize job status
+        background_jobs[job_id] = {
+            "status": "initializing",
+            "processed_items": 0,
+            "total_items": 0,
+            "updated_items": 0,
+            "skipped_items": 0,
+            "current_page": 0,
+            "total_pages": 0,
+            "namespace": namespace
+        }
+        
+        # Start background task
+        logger.info(f"Starting background task for job {job_id}")
+        background_tasks.add_task(
+            update_conference_embeddings,
+            request.conferenceName,
+            request.conferenceIteration,
+            request.index_name,
+            namespace,
+            request.chunk_size,
+            request.chunk_overlap,
+            request.max_pages,
+            job_id,
+            pc,
+            config
+        )
+        
+        success_message = f"Started updating conference data for {request.conferenceName} {request.conferenceIteration}"
+        logger.info(success_message)
+        
+        return EmbeddingResponse(
+            success=True,
+            message=success_message,
+            job_id=job_id,
+            count=0
+        )
+        
+    except Exception as e:
+        error_message = f"Error starting conference data update: {str(e)}"
+        logger.error(error_message, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
