@@ -284,7 +284,10 @@ async def process_conference_data(
         background_jobs[job_id]["total_items"] = total_document_count
         background_jobs[job_id]["status"] = f"Processing {total_document_count} documents"
         logger.info(f"Total documents collected: {total_document_count}")
-        
+        # all_documents_json = json.loads(all_documents)
+        # print("type of all_documents: ",type(all_documents))
+        # with open("all_documents.json", "w") as f:
+        #     json.dump(all_documents, f)
         # Create index if it doesn't exist
         logger.info(f"Checking if index {index_name} exists")
         if not pc.has_index(index_name):
@@ -307,7 +310,6 @@ async def process_conference_data(
             chunk_size=chunk_size, 
             chunk_overlap=chunk_overlap
         )
-        
         # Initialize embedding model
         logger.info("Initializing OpenAI embedding model (text-embedding-3-large)")
         embedding_model = OpenAIEmbeddings(
@@ -321,14 +323,46 @@ async def process_conference_data(
         batch_size = 20  # Adjust based on API rate limits and memory constraints
         logger.info(f"Processing documents in batches of {batch_size}")
         
+        # Initialize skip_count to track records we want to skip
+        skip_count = 0
+        logger.info(f"Will skip processing first {skip_count} records")
+        
         for i in range(0, len(all_documents), batch_size):
             batch_docs = all_documents[i:i+batch_size]
             logger.info(f"Processing batch {i//batch_size + 1} of {(len(all_documents) + batch_size - 1)//batch_size} ({len(batch_docs)} documents)")
+            
             all_chunks = []
             all_metadatas = []
             chunk_ids = []
             documents = []
+            print("batch_doc len: ",len(batch_docs))
+            # Calculate how many docs to skip in this batch
+            docs_to_process = []
             for doc_idx, doc in enumerate(batch_docs):
+                # Update the processed counter first
+                processed_count += 1
+                
+                # Skip if we haven't reached the threshold yet
+                if processed_count <= skip_count:
+                    logger.info(f"Skipping document {processed_count} of {skip_count}")
+                    continue
+                    
+                # Only process docs beyond our skip threshold
+                docs_to_process.append((doc_idx, doc))
+                
+            # Update job status after counting
+            background_jobs[job_id]["processed_items"] = processed_count
+            background_jobs[job_id]["status"] = f"Processed {processed_count} of {len(all_documents)} documents, skipping first {skip_count}"
+            
+            # Skip further processing if no docs to process in this batch
+            if not docs_to_process:
+                logger.info(f"No documents to process in this batch after skipping threshold")
+                continue
+                
+            logger.info(f"Processing {len(docs_to_process)} documents in this batch (after skipping threshold)")
+            
+            # Process only the docs we want to keep
+            for doc_idx, doc in docs_to_process:
                 # Format disease information
                 disease_info = "N/A"
                 if "disease" in doc and doc["disease"]:
@@ -358,13 +392,12 @@ async def process_conference_data(
                 
                 # Split into chunks
                 chunks = text_splitter.split_text(content)
-                logger.info(f"Document {i + doc_idx + 1}: Split into {len(chunks)} chunks")
+                logger.info(f"Document {processed_count - len(docs_to_process) + doc_idx + 1}: Split into {len(chunks)} chunks")
                 
                 # Create metadata for each chunk
                 for chunk in chunks:
                     doc_id = str(uuid.uuid4())
                     chunk_ids.append(doc_id)
-                    # all_chunks.append(chunk)
                     
                     # Create metadata with only the specified fields
                     metadata = prepare_safe_metadata(doc, doc_id, formatted_conf_name)
@@ -374,8 +407,6 @@ async def process_conference_data(
                         # Store disease names as a string to avoid complex nested structures in metadata
                         metadata["disease_names"] = disease_info
                     documents.append(Document(page_content=chunk, metadata=metadata,id=doc_id))
-            
-                    # all_metadatas.append(metadata)
             
             batch_docs_to_process = documents
             batch_texts_to_process = [doc.page_content for doc in batch_docs_to_process]
@@ -395,24 +426,19 @@ async def process_conference_data(
                 namespace=namespace
             )
             logger.info(f"Successfully upserted vectors to Pinecone")
-            # Upsert batch of vectors
-            # logger.info(f"Upserting {len(vectors)} vectors to Pinecone index '{index_name}', namespace '{namespace}'")
-            # index.upsert(
-            #     vectors=vectors,
-            #     namespace=namespace
-            # )
-            # logger.info(f"Successfully upserted vectors to Pinecone")
             
             # Add IDs to the global list
             document_ids.extend(chunk_ids)
             
-            # Update job status
-            processed_count += len(batch_docs)
-            background_jobs[job_id]["processed_items"] = processed_count
-            background_jobs[job_id]["status"] = f"Processed {processed_count} of {len(all_documents)} documents"
+            # Log progress - Note: processed_count is already updated earlier in the loop
+            logger.info(f"Progress: {processed_count}/{len(all_documents)} documents seen, processing documents > {skip_count}")
             
-            # Log progress
-            logger.info(f"Progress: {processed_count}/{len(all_documents)} documents processed ({(processed_count/len(all_documents)*100):.2f}%)")
+            # Update job status with specific threshold information
+            if processed_count <= skip_count:
+                logger.info(f"Still below threshold of {skip_count}, no documents processed yet")
+            else:
+                logger.info(f"Processed documents {skip_count+1} to {processed_count} out of {len(all_documents)} total documents")
+            
         # Job completed successfully
         background_jobs[job_id]["status"] = "completed"
         background_jobs[job_id]["document_ids"] = document_ids
@@ -726,11 +752,25 @@ class RagResponse(BaseModel):
     total_time_ms: float
 
 # Define prompt template for RAG
+#### v1 till may-12-2025
+# prompt_template = """You are an expert medical orator who analyzes abstracts from medical conferences to answer user questions.
+# If the abstracts contain ANY information related to the question, even if incomplete, summarize what is available, and always stick to the given abstracts. Do not provide any information beyond what's in the abstracts.
+# Only say you cannot answer if there is absolutely no relevant information. Present your answer in bullet points for easier understanding.
+# Try to go deep into the abstracts and identify all necessary information for the given query and summarize well.
+
+# QUESTION: {question}
+
+# RETRIEVED ABSTRACTS:
+# {context}
+
+# ANSWER:
+# """
+
 prompt_template = """You are an expert medical orator who analyzes abstracts from medical conferences to answer user questions.
 If the abstracts contain ANY information related to the question, even if incomplete, summarize what is available, and always stick to the given abstracts. Do not provide any information beyond what's in the abstracts.
 Only say you cannot answer if there is absolutely no relevant information. Present your answer in bullet points for easier understanding.
-Try to go deep into the abstracts and identify all necessary information for the given query and summarize well.
-
+Try to go deep into the abstracts and identify all necessary information for the given query and summarize well, please try to more analytical and to the point as you are givinig information to medical people who will be in hurry and required to get information in a concise and efficient manner, and highlight key aspect of the answer by bolding it and follow the markdown format for efficient formatting, and stick to given data only, do not add details from other sources.
+# And Try to sound like a helper which has good technical know how but also great at communicating complex stuff in easier way for people.
 QUESTION: {question}
 
 RETRIEVED ABSTRACTS:
