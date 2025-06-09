@@ -1,33 +1,113 @@
 from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file
 
-import os
+from datetime import datetime
+import os,re
 import uuid
 import requests
 import time
 import logging
 import fastapi
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks,Header, status
 from pydantic import BaseModel, Field
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.embeddings import OpenAIEmbeddings
 from pinecone import Pinecone, ServerlessSpec
 
-# Configure logging
+#### older file based saving in the .log file
+# log_dir = "/tmp/logs"
+# os.makedirs(log_dir, exist_ok=True)
+# log_file_path = os.path.join(log_dir, "vector_db_api.log")
+# # Configure logging
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+#     handlers=[
+#         logging.StreamHandler(),  # Log to console
+#         logging.FileHandler("vector_db_api.log")  # Log to file
+#     ]
+# )
+
+# logger = logging.getLogger("vector_db_api")
+
+#### newer direct aws cloudwatch logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # Log to console
-        logging.FileHandler("vector_db_api.log")  # Log to file
-    ]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("vector_db_api")
+def extract_acronym_data(input_string):
+    """
+    Extracts the last four digits as 'year' and converts the rest into
+    'ONEWORD-SECONDWORD' uppercase format.
+
+    Args:
+        input_string (str): The input string (e.g., "asco-gu-2025").
+
+    Returns:
+        tuple: A tuple containing (formatted_rest_of_string_uppercase, year)
+               or (None, None) if no year is found.
+    """
+    # 1. Extract the year
+    year_pattern = r'(\d{4})$'
+    year_match = re.search(year_pattern, input_string)
+
+    if not year_match:
+        return None, None  # No year found, so we can't process further
+
+    year = year_match.group(1)
+    # Remove the year and any trailing non-alphanumeric characters or spaces that might have been part of the separator
+    rest_of_string = input_string[:year_match.start()]
+
+    # 2. Process rest_of_string into 'ONEWORD-SECONDWORD' format
+    # Split by one or more hyphens, underscores, or spaces
+    cleaned_parts = re.split(r'[-_ ]+', rest_of_string)
+
+    # Filter out empty strings and strip leading/trailing whitespace
+    cleaned_parts = [part.strip() for part in cleaned_parts if part.strip()]
+
+    formatted_rest = ""
+    if len(cleaned_parts) >= 2:
+        # Take the first two parts, join with hyphen, and convert to uppercase
+        formatted_rest = f"{cleaned_parts[0].upper()}-{cleaned_parts[1].upper()}"
+    elif len(cleaned_parts) == 1:
+        # If only one part, just convert it to uppercase
+        formatted_rest = cleaned_parts[0].upper()
+    # If cleaned_parts is empty, formatted_rest remains ""
+
+    return formatted_rest, year
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Vector Database API", 
               description="API for managing document embeddings in Pinecone")
+API_KEY = os.environ.get("X_API_KEY")
 
+# Dependency to validate the API key
+async def verify_api_key(x_api_key: str = Header(..., alias="x-api-key")):
+    """
+    Verifies the x-api-key provided in the request header.
+
+    Args:
+        x_api_key: The API key extracted from the 'x-api-key' header.
+
+    Raises:
+        HTTPException: If the API key is missing or invalid.
+    """
+    print("x_api_key: ",x_api_key)
+    print("API_KEY: ",API_KEY)
+    if x_api_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="X-API-Key header is missing",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if x_api_key != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid X-API-Key",
+        )
+    return x_api_key
 # Environment configuration
 class Config:
     def __init__(self):
@@ -89,9 +169,11 @@ class EmbeddingResponse(BaseModel):
     job_id: Optional[str] = None
 
 class ConferenceDataRequest(BaseModel):
-    conferenceName: str
-    conferenceIteration: str
-    index_name: str = "conference-data"
+    conferenceAcronym: str
+    conferenceName: str = ""
+    conferenceIteration: str = ""
+    timeStamp:datetime = ""
+    index_name: str = "conference-data-production"
     namespace: str = "default"
     chunk_size: int = 2000
     chunk_overlap: int = 300
@@ -109,14 +191,18 @@ class JobStatusResponse(BaseModel):
 # Dictionary to track background jobs
 background_jobs = {}
 
-def fetch_conference_data(conference_name: str, page: int = 1):
-    """Fetch conference data from the API for a specific page"""
-    api_url = f"https://lt.larvol.com/api/news.php?paged_mode=yes&page={page}&conf_name={conference_name}"
+def fetch_conference_data(conference_name: str, page: int = 1,timeStamp:datetime = ""):
     
+    """Fetch conference data from the API for a specific page"""
+    if(timeStamp!=""):
+        print("fetching with timestamp: ",timeStamp)
+        api_url = f"https://lt.larvol.com/api/news.php?paged_mode=yes&page={page}&conf_name={conference_name}&timestamp={timeStamp}"
+    else:
+        api_url = f"https://lt.larvol.com/api/news.php?paged_mode=yes&page={page}&conf_name={conference_name}"
     logger.info(f"Fetching data from {api_url}")
     
     # Get API key from environment
-    api_key = "596c36c6-0ecd-11f0-8583-0221c24e933b"
+    api_key = os.getenv("LARVOL_API_KEY")
     
     if not api_key:
         logger.error("LARVOL_API_KEY environment variable is not set")
@@ -375,7 +461,8 @@ async def process_conference_data(
                 content = f"""
                     Title: {title}
                     Date: {doc.get('date', 'N/A')}
-                    Time: {doc.get('start_time', 'N/A')} - {doc.get('end_time', 'N/A')}
+                    startTime: {doc.get('start_time', 'N/A')} 
+                    endTime: {doc.get('end_time', 'N/A')}
                     Location: {doc.get('location', 'N/A')}
                     Category: {doc.get('category', 'N/A')}
                     SubCategory: {doc.get('sub_category', 'N/A')}
@@ -388,6 +475,20 @@ async def process_conference_data(
                     Details: {doc.get('details', 'N/A')}
                     Summary: {doc.get('summary', 'N/A')}
                     Authors: {doc.get('authors', 'N/A')}
+                    redtagId: {doc.get('redtag_id', 'N/A')}
+                    newsType: {doc.get('news_type', 'N/A')}
+                    abstractNumber: {doc.get('abstract_number', 'N/A')}
+                    sourceType: {doc.get('source_type', 'N/A')}
+                    sessionType: {doc.get('session_type', 'N/A')}
+                    sessionText: {doc.get('session_text', 'N/A')}
+                    affiliations: {doc.get('affiliations', 'N/A')}
+                    institution: {doc.get('institution', 'N/A')}
+                    sponsor : {doc.get('sponsor', 'N/A')}
+                    briefTitle: {doc.get('brief_title', 'N/A')}
+                    journalName: {doc.get('journal_name', 'N/A')}
+                    investigator: {doc.get('investigator', 'N/A')}
+                    sessionTitle: {doc.get('session_title', 'N/A')}
+                    kol: {doc.get('kol', 'N/A')}
                 """
                 
                 # Split into chunks
@@ -599,7 +700,7 @@ async def create_embeddings(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ingest_conference_data", response_model=EmbeddingResponse)
+@app.post("/api/ingest_conference_data", response_model=EmbeddingResponse, dependencies=[Depends(verify_api_key)])
 async def ingest_conference_data(
     request: ConferenceDataRequest,
     background_tasks: BackgroundTasks,
@@ -610,9 +711,14 @@ async def ingest_conference_data(
     Ingest conference data from the Larvol API and create embeddings.
     This will run as a background task and return a job ID for tracking progress.
     """
-    logger.info(f"Received request to ingest conference data: {request.conferenceName} {request.conferenceIteration}")
-    
+    # acronym = request.conferenceAcronym.split("_")
+    acronym = request.conferenceAcronym
+    request.conferenceName,request.conferenceIteration = extract_acronym_data(acronym)
     try:
+        # request.conferenceName = acronym[0] if len(acronym) > 0 else request.conferenceName
+        # request.conferenceIteration = acronym[1] if len(acronym) > 1 else request.conferenceIteration
+        request.conferenceName,request.conferenceIteration = extract_acronym_data(acronym)
+        logger.info(f"Received request to ingest conference data: {request.conferenceName} {request.conferenceIteration}")
         # Generate a job ID
         job_id = str(uuid.uuid4())
         logger.info(f"Generated job ID: {job_id}")
@@ -703,17 +809,6 @@ from langchain.chat_models import ChatOpenAI
 from langchain.schema import Document
 from pinecone import Pinecone, ServerlessSpec
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # Log to console
-        logging.FileHandler("vector_db_api.log")  # Log to file
-    ]
-)
-logger = logging.getLogger("vector_db_api")
-
 class QueryRequest(BaseModel):
     index_name: str = "conference-data"
     query_text: str
@@ -735,8 +830,9 @@ class QueryResponse(BaseModel):
     query_time_ms: Optional[float] = None
     
 class ConferenceQueryRequest(BaseModel):
-    conferenceName: str
-    conferenceIteration: str
+    acronym: str
+    conferenceName: str = ""
+    conferenceIteration: str = ""
     query: str
     top_k: int = 5
     use_rag: bool = True
@@ -906,7 +1002,7 @@ class StreamingCallbackHandler(StreamingStdOutCallbackHandler):
         self.tokens.append(token)
         self.text += token
 
-@app.post("/api/conference/query_streaming")
+@app.post("/api/conference/query_streaming",dependencies=[Depends(verify_api_key)])
 async def query_conference_data(
     request: ConferenceQueryRequest,
     response: fastapi.Response,
@@ -918,12 +1014,18 @@ async def query_conference_data(
     Query conference data and optionally use RAG to generate a natural language response
     with simplified streaming capability for real-time response display.
     """
-    try:
+    try:    
+        # acronym = request.acronym.split("_")
+        # logger.info(f"Received conference query: {request.conferenceAcronym}")
+        # request.conferenceName = acronym[0] if len(acronym) > 0 else request.conferenceName
+        # request.conferenceIteration = acronym[1] if len(acronym) > 1 else request.conferenceIteration
+        acronym = request.acronym
+        request.conferenceName,request.conferenceIteration = extract_acronym_data(acronym)
         logger.info(f"Processing conference query: '{request.query}' for {request.conferenceName} {request.conferenceIteration}")
         
         # Create namespace from conference name and iteration
         namespace = f"{request.conferenceName.lower()}_{request.conferenceIteration}"
-        index_name = "conference-data"
+        index_name = "conference-data-production"
         
         # Check if index exists
         if not pc.has_index(index_name):
@@ -1088,20 +1190,10 @@ async def query_conference_data(
         raise HTTPException(status_code=500, detail=str(e))
       
 ######## update functionality
-
-class JobStatusResponse(BaseModel):
-    job_id: str
-    status: str
-    processed_items: int = 0
-    total_items: int = 0
-    updated_items: int = 0
-    skipped_items: int = 0
-    current_page: int = 0
-    total_pages: int = 0
-    message: Optional[str] = None
 async def update_conference_embeddings(
     conference_name: str,
     conference_iteration: str,
+    timeStamp:datetime,
     index_name: str,
     namespace: str,
     chunk_size: int,
@@ -1113,7 +1205,7 @@ async def update_conference_embeddings(
 ):
     """Background task to update conference data embeddings only if version has changed"""
     try:
-        logger.info(f"Starting update job {job_id} for conference {conference_name} {conference_iteration}")
+        logger.info(f"Starting update job {job_id} for conference {conference_name} {conference_iteration} in timestamp {timeStamp}")
         
         background_jobs[job_id] = {
             "status": "running", 
@@ -1131,7 +1223,7 @@ async def update_conference_embeddings(
         
         # Fetch first page to get total pages
         logger.info(f"Fetching first page to determine total pages")
-        documents, total_pages = fetch_conference_data(formatted_conf_name, 1)
+        documents, total_pages = fetch_conference_data(formatted_conf_name, 1,timeStamp)
         
         # Limit total pages to max_pages
         total_pages = min(total_pages, max_pages)
@@ -1349,7 +1441,7 @@ async def update_conference_embeddings(
         background_jobs[job_id]["status"] = "failed"
         background_jobs[job_id]["message"] = str(e)
 
-@app.post("/api/update_conference_data", response_model=EmbeddingResponse)
+@app.post("/api/update_conference_data", response_model=EmbeddingResponse,dependencies=[Depends(verify_api_key)])
 async def update_conference_data(
     request: ConferenceDataRequest,
     background_tasks: BackgroundTasks,
@@ -1360,10 +1452,16 @@ async def update_conference_data(
     Update conference data embeddings, but only if the Conf_Upload_Version has changed.
     This will run as a background task and return a job ID for tracking progress.
     """
-    logger.info(f"Received request to update conference data: {request.conferenceName} {request.conferenceIteration}")
+    # acronym = request.conferenceAcronym.split("_")
+    acronym = request.conferenceAcronym
+    # logger.info(f"Received request to update conference data: {request.conferenceName} {request.conferenceIteration}")
     
     try:
         # Generate a job ID
+        request.conferenceName,request.conferenceIteration = extract_acronym_data(acronym)
+        # request.conferenceName = acronym[0] if len(acronym) > 0 else request.conferenceName
+        # request.conferenceIteration = acronym[1] if len(acronym) > 1 else request.conferenceIteration
+        logger.info(f"Processing conference data update for {request.conferenceName} {request.conferenceIteration}")
         job_id = str(uuid.uuid4())
         logger.info(f"Generated job ID: {job_id}")
         namespace = f"{request.conferenceName}_{request.conferenceIteration}".lower().replace(" ", "_")
@@ -1388,6 +1486,7 @@ async def update_conference_data(
             update_conference_embeddings,
             request.conferenceName,
             request.conferenceIteration,
+            request.timeStamp,
             request.index_name,
             namespace,
             request.chunk_size,
@@ -1412,3 +1511,23 @@ async def update_conference_data(
         error_message = f"Error starting conference data update: {str(e)}"
         logger.error(error_message, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/webhook/update_conference_data", response_model=EmbeddingResponse,dependencies=[Depends(verify_api_key)])
+async def update_conference_data_webhook(
+    request: ConferenceDataRequest,
+):
+    # acronym = request.conferenceAcronym.split("_")
+    # print(acronym)
+    # request.conferenceName = acronym[0] if len(acronym) > 0 else request.conferenceName
+    # request.conferenceIteration = acronym[1] if len(acronym) > 1 else request.conferenceIteration
+    acronym = request.conferenceAcronym
+    request.conferenceName,request.conferenceIteration = extract_acronym_data(acronym)
+     
+    success_message = f"Started updating conference data for {request.conferenceName} {request.conferenceIteration}"
+    logger.info(success_message)
+    return EmbeddingResponse(
+            success=True,
+            message=success_message,
+            job_id=str(uuid.uuid4()),  # Generate a unique job ID
+            count=0
+        )
