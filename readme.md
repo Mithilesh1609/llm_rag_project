@@ -36,7 +36,7 @@ cd llm_project
 pip install -r requirements.txt
 ```
 
-### Usage
+### Usage older way
 
 #### Embedding Generation
 
@@ -48,4 +48,10 @@ python embedding_generation_pipeline.py
 
 ```bash
 python query_testing_pipeline.py
+```
+
+### new way
+go to production_setup folder and then run this command
+``` bash
+uvicorn main:app --host 0.0.0.0 --port 8070 --reload --workers 4
 ```
